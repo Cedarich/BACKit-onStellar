@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "call_registry",
+    "outcome_manager",
+    "shared",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[workspace.dependencies]
+soroban-sdk = "21.0.0"
