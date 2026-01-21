@@ -161,3 +161,5 @@ After this PR is merged, subsequent issues can:
 **Ready for Review** 🚀
 
 This PR establishes the foundational structure for the entire BACKit-onStellar project, enabling efficient development across all packages with proper tooling and configuration.
+
+Thank you!
