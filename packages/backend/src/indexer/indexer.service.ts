@@ -10,11 +10,23 @@ import { ConfigService } from '../config/config.service';
 import { parseAdminParamsChanged } from './parsers/admin-params.parser';
 import { PayoutsService } from '../payouts/payouts.service';
 import { TreasuryService } from '../treasury/treasury.service';
+import { FailedTransaction } from './entities/failed-transaction.entity';
+import {
+  DiagnosticParserService,
+  TransactionDiagnosticReport,
+} from './diagnostic-parser.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { NotificationType } from '../notifications/notification-type.enum';
+
+/** notifications.message is varchar(255). */
+const MAX_NOTIFICATION_LENGTH = 255;
 
 @Injectable()
 export class IndexerService {
   private readonly logger = new Logger(IndexerService.name);
   private readonly contractId = process.env.SOROBAN_CONTRACT_ID ?? '';
+  /** Whether event_logs_max_ledger() (PartitionEventStore migration) exists. */
+  private maxLedgerHelperAvailable = true;
 
   constructor(
     private readonly rpcServer: SorobanRpc.Server,
@@ -25,6 +37,10 @@ export class IndexerService {
     private readonly configService: ConfigService,
     private readonly payoutsService: PayoutsService,
     private readonly treasuryService: TreasuryService,
+    @InjectRepository(FailedTransaction)
+    private readonly failedTxRepository: Repository<FailedTransaction>,
+    private readonly diagnosticParser: DiagnosticParserService,
+    private readonly notificationsService: NotificationsService,
   ) {}
 
   // ─── Status ───────────────────────────────────────────────────────────────
@@ -32,10 +48,7 @@ export class IndexerService {
   async getStatus() {
     const isRunning = true;
     const totalEventsIndexed = await this.eventLogRepository.count();
-    const latestEvent = await this.eventLogRepository.findOne({
-      where: {},
-      order: { ledger: 'DESC' },
-    });
+    const latestEvent = await this.findLatestEvent();
 
     return {
       isRunning,
@@ -141,6 +154,7 @@ export class IndexerService {
         eventId: `${txHash}-admin-params`,
         pagingToken: `${ledger}-${txHash}`,
         contractId: this.contractId,
+        topic0: 'AdminParamsChanged',
         eventType: EventType.ADMIN_PARAMS_CHANGED,
         ledger,
         txHash,
@@ -294,27 +308,176 @@ export class IndexerService {
   async submitTransaction(
     tx: Parameters<SorobanRpc.Server['sendTransaction']>[0],
   ): Promise<SorobanRpc.Api.SendTransactionResponse> {
-    return retryWithBackoff(
+    const response = await retryWithBackoff(
       () => this.rpcServer.sendTransaction(tx),
       4,
       1000,
       'submitTransaction',
     );
+
+    if (response?.status === 'ERROR') {
+      const report =
+        this.diagnosticParser.analyzeSendTransactionResponse(response);
+      const source = tx as {
+        source?: string;
+        innerTransaction?: { source?: string };
+      };
+      await this.recordFailedTransaction(report, {
+        userAddress: source.innerTransaction?.source ?? source.source ?? null,
+        ledger: response.latestLedger ?? null,
+      });
+    }
+
+    return response;
+  }
+
+  // ─── Failed Transactions (BE-004) ─────────────────────────────────────────
+
+  /**
+   * Fetch a transaction by hash and, if it failed on-chain, parse its
+   * diagnostics, persist them to `failed_transactions` and notify the
+   * submitting user. Returns the report, or null if the transaction did not
+   * fail (or could not be fetched). Never throws.
+   */
+  async indexFailedTransaction(
+    txHash: string,
+    userAddress?: string | null,
+  ): Promise<TransactionDiagnosticReport | null> {
+    try {
+      const response = await retryWithBackoff(
+        () => this.rpcServer.getTransaction(txHash),
+        4,
+        1000,
+        `getTransaction(${txHash})`,
+      );
+      if (response.status !== SorobanRpc.Api.GetTransactionStatus.FAILED) {
+        return null;
+      }
+
+      const report = this.diagnosticParser.analyzeGetTransactionResponse(
+        txHash,
+        response,
+      );
+      await this.recordFailedTransaction(report, {
+        userAddress:
+          userAddress ??
+          this.diagnosticParser.extractSourceAccount(response.envelopeXdr),
+        ledger: response.ledger ?? null,
+      });
+      return report;
+    } catch (err) {
+      this.logger.warn(
+        `indexFailedTransaction(${txHash}) failed: ${(err as Error).message}`,
+      );
+      return null;
+    }
+  }
+
+  private async recordFailedTransaction(
+    report: TransactionDiagnosticReport,
+    ctx: { userAddress: string | null; ledger: number | null },
+  ): Promise<void> {
+    this.diagnosticParser.logReport(report, { userAddress: ctx.userAddress });
+    if (!report.failed || !report.txHash) return;
+
+    try {
+      const primary = report.primaryError;
+      const existing = await this.failedTxRepository.findOne({
+        where: { txHash: report.txHash },
+      });
+
+      const row = await this.failedTxRepository.save(
+        this.failedTxRepository.create({
+          ...(existing ?? {}),
+          txHash: report.txHash,
+          contractId: report.contractId ?? existing?.contractId ?? null,
+          userAddress: ctx.userAddress ?? existing?.userAddress ?? null,
+          ledger: ctx.ledger ?? existing?.ledger ?? null,
+          resultCode: report.resultCode,
+          operationResultCode: report.operationResultCode,
+          errorCategory: primary?.category ?? null,
+          errorName:
+            primary?.enumName && primary.errorName
+              ? `${primary.enumName}::${primary.errorName}`
+              : (primary?.codeName ?? null),
+          errorCode: primary?.code ?? null,
+          message: report.summary,
+          diagnostics: report,
+          notified: existing?.notified ?? false,
+        }),
+      );
+
+      if (row.userAddress && !row.notified) {
+        await this.notificationsService.notify(
+          row.userAddress,
+          NotificationType.TRANSACTION_FAILED,
+          this.truncate(`Transaction failed: ${report.summary}`),
+          report.txHash,
+        );
+        row.notified = true;
+        await this.failedTxRepository.save(row);
+      }
+    } catch (err) {
+      // Diagnostics are best-effort: never let them break the caller.
+      this.logger.warn({
+        msg: 'Failed to persist failed transaction diagnostics',
+        txHash: report.txHash,
+        error: (err as Error).message,
+      });
+    }
+  }
+
+  private truncate(message: string): string {
+    return message.length <= MAX_NOTIFICATION_LENGTH
+      ? message
+      : `${message.slice(0, MAX_NOTIFICATION_LENGTH - 1)}…`;
   }
 
   // ─── Private Helpers ──────────────────────────────────────────────────────
 
   private async resolveStartLedger(): Promise<number> {
-    const latestEvent = await this.eventLogRepository.findOne({
-      where: {},
-      order: { ledger: 'DESC' },
-    });
+    const latestEvent = await this.findLatestEvent();
 
     if (latestEvent?.ledger) {
-      return latestEvent.ledger + 1;
+      // bigint columns come back from pg as strings.
+      return Number(latestEvent.ledger) + 1;
     }
 
     const latest = await this.getLatestLedger();
     return Math.max(latest.sequence - 5, 1);
+  }
+
+  /**
+   * Latest indexed event. On the partitioned table a bare
+   * `ORDER BY ledger DESC LIMIT 1` plans a Merge Append over every
+   * partition, so resolve the max ledger via event_logs_max_ledger() (probes
+   * newest partitions first) and then do a single-partition point lookup.
+   * Falls back to the plain query where the helper is absent (unmigrated
+   * databases, tests).
+   */
+  private async findLatestEvent(): Promise<EventLog | null> {
+    if (this.maxLedgerHelperAvailable) {
+      try {
+        const rows = await this.eventLogRepository.query<
+          Array<{ ledger: string | number | null }>
+        >('SELECT event_logs_max_ledger() AS ledger');
+        const ledger = rows?.[0]?.ledger;
+        if (ledger === null || ledger === undefined) return null;
+        return await this.eventLogRepository.findOne({
+          where: { ledger: Number(ledger) },
+          order: { id: 'DESC' },
+        });
+      } catch {
+        this.maxLedgerHelperAvailable = false;
+        this.logger.debug(
+          'event_logs_max_ledger() unavailable — using unpartitioned latest-event query',
+        );
+      }
+    }
+
+    return this.eventLogRepository.findOne({
+      where: {},
+      order: { ledger: 'DESC' },
+    });
   }
 }
