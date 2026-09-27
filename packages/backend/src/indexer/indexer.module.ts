@@ -12,10 +12,12 @@ import { PlatformConfigModule } from '../config/config.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { PayoutsModule } from '../payouts/payouts.module';
 import { TreasuryModule } from '../treasury/treasury.module';
+import { FailedTransaction } from './entities/failed-transaction.entity';
+import { DiagnosticParserService } from './diagnostic-parser.service';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([EventLog, PlatformSettings]),
+    TypeOrmModule.forFeature([EventLog, PlatformSettings, FailedTransaction]),
     ScheduleModule.forRoot(),
     PlatformConfigModule,
     NotificationsModule,
@@ -27,6 +29,7 @@ import { TreasuryModule } from '../treasury/treasury.module';
     IndexerService,
     EventParser,
     PlatformSettingsService,
+    DiagnosticParserService,
     {
       provide: SorobanRpc.Server,
       useFactory: () => {
@@ -36,6 +39,6 @@ import { TreasuryModule } from '../treasury/treasury.module';
       },
     },
   ],
-  exports: [IndexerService],
+  exports: [IndexerService, DiagnosticParserService],
 })
 export class IndexerModule {}

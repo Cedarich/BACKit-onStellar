@@ -7,7 +7,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource, EntityManager } from 'typeorm';
+import { Between, Repository, DataSource, EntityManager } from 'typeorm';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
 import { InjectQueue } from '@nestjs/bullmq';
@@ -651,15 +651,13 @@ export class ReconciliationService {
     // Query event logs stored locally in eventLogRepo or Soroban RPC
     for (const contractId of contractIds) {
       try {
-        // First check locally indexed EventLog for the ledger range
-        const localLogs = await this.eventLogRepo.find({
-          where: { contractId },
+        // First check locally indexed EventLog for the ledger range. The
+        // range is pushed into SQL so Postgres prunes event_logs partitions
+        // instead of loading the contract's whole history into memory.
+        const filtered = await this.eventLogRepo.find({
+          where: { contractId, ledger: Between(fromLedger, toLedger) },
           order: { ledger: 'ASC', txOrder: 'ASC' },
         });
-
-        const filtered = localLogs.filter(
-          (l) => l.ledger >= fromLedger && l.ledger <= toLedger,
-        );
 
         if (filtered.length > 0) {
           filtered.forEach((log, index) => {

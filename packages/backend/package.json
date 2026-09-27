@@ -23,7 +23,9 @@
     "typeorm:generate": "npm run typeorm -- migration:generate",
     "typeorm:run": "npm run typeorm -- migration:run",
     "typeorm:revert": "npm run typeorm -- migration:revert",
-    "typeorm:show": "npm run typeorm -- migration:show"
+    "typeorm:show": "npm run typeorm -- migration:show",
+    "generate:contract-errors": "node scripts/generate-contract-errors.js",
+    "check:contract-errors": "node scripts/generate-contract-errors.js --check"
   },
   "dependencies": {
     "@nestjs/axios": "^4.0.1",

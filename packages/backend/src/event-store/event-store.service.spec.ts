@@ -8,6 +8,7 @@ import {
 } from './entities/event-store-entry.entity';
 import { AggregateSnapshot } from './entities/aggregate-snapshot.entity';
 import { correlationStorage } from '../common/middleware/correlation-id.middleware';
+import { EventLog } from '../indexer/event-log.entity';
 
 describe('EventStoreService', () => {
   let service: EventStoreService;
@@ -26,6 +27,18 @@ describe('EventStoreService', () => {
     findOne: jest.fn(),
   };
 
+  const eventLogQb = {
+    where: jest.fn().mockReturnThis(),
+    andWhere: jest.fn().mockReturnThis(),
+    orderBy: jest.fn().mockReturnThis(),
+    addOrderBy: jest.fn().mockReturnThis(),
+    limit: jest.fn().mockReturnThis(),
+    getMany: jest.fn(),
+  };
+  const eventLogRepo = {
+    createQueryBuilder: jest.fn(() => eventLogQb),
+  };
+
   beforeEach(async () => {
     jest.clearAllMocks();
     eventRepo.count.mockResolvedValue(0);
@@ -39,6 +52,7 @@ describe('EventStoreService', () => {
           provide: getRepositoryToken(AggregateSnapshot),
           useValue: snapshotRepo,
         },
+        { provide: getRepositoryToken(EventLog), useValue: eventLogRepo },
       ],
     }).compile();
 
@@ -298,6 +312,91 @@ describe('EventStoreService', () => {
           version: 20,
         }),
       );
+    });
+  });
+
+  describe('getRawEventsByLedgerRange', () => {
+    it('builds a partition-prunable contract/topic/ledger range scan', async () => {
+      eventLogQb.getMany.mockResolvedValueOnce([{ id: 1, ledger: 150 }]);
+
+      const rows = await service.getRawEventsByLedgerRange({
+        contractId: 'CID',
+        topic0: 'PayoutClaimed',
+        fromLedger: 100,
+        toLedger: 200,
+        limit: 50,
+      });
+
+      expect(rows).toEqual([{ id: 1, ledger: 150 }]);
+      expect(eventLogQb.where).toHaveBeenCalledWith(
+        'log.contractId = :contractId',
+        { contractId: 'CID' },
+      );
+      expect(eventLogQb.andWhere).toHaveBeenCalledWith(
+        'log.ledger >= :fromLedger',
+        { fromLedger: 100 },
+      );
+      expect(eventLogQb.andWhere).toHaveBeenCalledWith(
+        'log.ledger <= :toLedger',
+        { toLedger: 200 },
+      );
+      expect(eventLogQb.andWhere).toHaveBeenCalledWith('log.topic0 = :topic0', {
+        topic0: 'PayoutClaimed',
+      });
+      expect(eventLogQb.orderBy).toHaveBeenCalledWith('log.ledger', 'ASC');
+      expect(eventLogQb.addOrderBy).toHaveBeenCalledWith('log.id', 'ASC');
+      expect(eventLogQb.limit).toHaveBeenCalledWith(50);
+    });
+
+    it('omits the topic filter and applies a keyset cursor', async () => {
+      eventLogQb.getMany.mockResolvedValueOnce([]);
+
+      await service.getRawEventsByLedgerRange({
+        contractId: 'CID',
+        fromLedger: 1,
+        toLedger: 10,
+        after: { ledger: 5, id: 42 },
+      });
+
+      expect(eventLogQb.andWhere).not.toHaveBeenCalledWith(
+        'log.topic0 = :topic0',
+        expect.anything(),
+      );
+      expect(eventLogQb.andWhere).toHaveBeenCalledWith(
+        '(log.ledger, log.id) > (:afterLedger, :afterId)',
+        { afterLedger: 5, afterId: 42 },
+      );
+      expect(eventLogQb.limit).toHaveBeenCalledWith(100);
+    });
+
+    it('clamps the page size', async () => {
+      eventLogQb.getMany.mockResolvedValue([]);
+      await service.getRawEventsByLedgerRange({
+        contractId: 'CID',
+        fromLedger: 1,
+        toLedger: 2,
+        limit: 1_000_000,
+      });
+      expect(eventLogQb.limit).toHaveBeenLastCalledWith(1000);
+
+      await service.getRawEventsByLedgerRange({
+        contractId: 'CID',
+        fromLedger: 1,
+        toLedger: 2,
+        limit: 0,
+      });
+      expect(eventLogQb.limit).toHaveBeenLastCalledWith(1);
+    });
+
+    it('returns nothing for an inverted range without querying', async () => {
+      await expect(
+        service.getRawEventsByLedgerRange({
+          contractId: 'CID',
+          fromLedger: 10,
+          toLedger: 1,
+        }),
+      ).resolves.toEqual([]);
+      expect(eventLogRepo.createQueryBuilder).not.toHaveBeenCalled();
     });
   });
 });

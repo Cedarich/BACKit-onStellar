@@ -1,12 +1,16 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { SorobanRpc, xdr } from '@stellar/stellar-sdk';
+import { Keypair, SorobanRpc, StrKey, xdr } from '@stellar/stellar-sdk';
 import { IndexerService } from './indexer.service';
 import { EventLog } from './event-log.entity';
 import { PlatformSettings } from './entities/platform-settings.entity';
 import { ConfigService } from '../config/config.service';
 import { PayoutsService } from '../payouts/payouts.service';
 import { TreasuryService } from '../treasury/treasury.service';
+import { FailedTransaction } from './entities/failed-transaction.entity';
+import { DiagnosticParserService } from './diagnostic-parser.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { NotificationType } from '../notifications/notification-type.enum';
 
 jest.mock('./parsers/admin-params.parser', () => ({
   parseAdminParamsChanged: jest.fn(),
@@ -27,6 +31,7 @@ describe('IndexerService', () => {
     getLatestLedger: jest.fn(),
     getLedgerEntries: jest.fn(),
     sendTransaction: jest.fn(),
+    getTransaction: jest.fn(),
   };
   const eventLogRepo = {
     findOne: jest.fn(),
@@ -49,6 +54,15 @@ describe('IndexerService', () => {
   const treasuryService = {
     recordFeeFromPayoutClaimed: jest.fn(),
   };
+  const failedTxRepo = {
+    findOne: jest.fn(),
+    create: jest.fn((v) => v),
+    save: jest.fn(async (v) => v),
+  };
+  const notificationsService = {
+    notify: jest.fn(),
+  };
+  const diagnosticParser = new DiagnosticParserService();
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -66,6 +80,12 @@ describe('IndexerService', () => {
         { provide: ConfigService, useValue: configService },
         { provide: PayoutsService, useValue: payoutsService },
         { provide: TreasuryService, useValue: treasuryService },
+        {
+          provide: getRepositoryToken(FailedTransaction),
+          useValue: failedTxRepo,
+        },
+        { provide: DiagnosticParserService, useValue: diagnosticParser },
+        { provide: NotificationsService, useValue: notificationsService },
       ],
     }).compile();
 
@@ -327,6 +347,269 @@ describe('IndexerService', () => {
     expect(treasuryService.recordFeeFromPayoutClaimed).toHaveBeenCalledWith(
       expect.objectContaining({ claimedAmount: '123' }),
     );
+  });
+
+  // ─── Latest event lookup on the partitioned table (BE-003) ──────────────
+
+  describe('latest event lookup', () => {
+    afterEach(() => {
+      delete (eventLogRepo as any).query;
+    });
+
+    it('uses event_logs_max_ledger() then a point lookup when available', async () => {
+      (eventLogRepo as any).query = jest
+        .fn()
+        .mockResolvedValue([{ ledger: '4200' }]);
+      eventLogRepo.findOne.mockResolvedValueOnce({ id: 9, ledger: '4200' });
+      rpcServer.getEvents.mockResolvedValue({ events: [] });
+
+      await service.processNewEvents();
+
+      expect(eventLogRepo.findOne).toHaveBeenCalledWith({
+        where: { ledger: 4200 },
+        order: { id: 'DESC' },
+      });
+      // bigint strings from pg must be treated numerically, not concatenated.
+      expect(rpcServer.getEvents).toHaveBeenCalledWith(
+        expect.objectContaining({ startLedger: 4201 }),
+      );
+    });
+
+    it('returns null status when the helper reports an empty table', async () => {
+      (eventLogRepo as any).query = jest
+        .fn()
+        .mockResolvedValue([{ ledger: null }]);
+      eventLogRepo.count.mockResolvedValue(0);
+
+      const status = await service.getStatus();
+      expect(status.latestEventLedger).toBeNull();
+      expect(eventLogRepo.findOne).not.toHaveBeenCalled();
+    });
+
+    it('falls back to ORDER BY ledger once when the helper is missing', async () => {
+      (eventLogRepo as any).query = jest
+        .fn()
+        .mockRejectedValue(
+          new Error('function event_logs_max_ledger() does not exist'),
+        );
+      eventLogRepo.findOne.mockResolvedValue({ ledger: 7 });
+      eventLogRepo.count.mockResolvedValue(1);
+
+      await service.getStatus();
+      await service.getStatus();
+
+      expect((eventLogRepo as any).query).toHaveBeenCalledTimes(1);
+      expect(eventLogRepo.findOne).toHaveBeenCalledWith({
+        where: {},
+        order: { ledger: 'DESC' },
+      });
+    });
+  });
+
+  // ─── Failed transaction indexing (BE-004) ────────────────────────────────
+
+  describe('failed transactions', () => {
+    const CONTRACT = StrKey.encodeContract(Buffer.alloc(32, 7));
+    const USER = Keypair.random().publicKey();
+
+    const errorEvent = (code: number) =>
+      new xdr.DiagnosticEvent({
+        inSuccessfulContractCall: false,
+        event: new xdr.ContractEvent({
+          ext: new (xdr.ExtensionPoint as any)(0),
+          contractId: StrKey.decodeContract(CONTRACT) as any,
+          type: xdr.ContractEventType.diagnostic(),
+          body: new (xdr.ContractEventBody as any)(
+            0,
+            new xdr.ContractEventV0({
+              topics: [
+                xdr.ScVal.scvSymbol('error'),
+                xdr.ScVal.scvError(xdr.ScError.sceContract(code)),
+              ],
+              data: xdr.ScVal.scvString('failed'),
+            }),
+          ),
+        }),
+      });
+
+    beforeAll(() => {
+      diagnosticParser.registerContract(CONTRACT, 'call_registry');
+      jest
+        .spyOn((diagnosticParser as any).logger, 'warn')
+        .mockImplementation(() => {});
+    });
+
+    beforeEach(() => {
+      failedTxRepo.findOne.mockResolvedValue(null);
+    });
+
+    it('indexes and notifies when sendTransaction returns ERROR', async () => {
+      rpcServer.sendTransaction.mockResolvedValueOnce({
+        status: 'ERROR',
+        hash: 'hash-err',
+        latestLedger: 555,
+        diagnosticEvents: [errorEvent(6)],
+      });
+
+      const res = await service.submitTransaction({ source: USER } as any);
+
+      expect(res.status).toBe('ERROR');
+      expect(failedTxRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          txHash: 'hash-err',
+          contractId: CONTRACT,
+          userAddress: USER,
+          ledger: 555,
+          errorCategory: 'contract',
+          errorName: 'CallRegistryError::CallEnded',
+          errorCode: 6,
+        }),
+      );
+      expect(notificationsService.notify).toHaveBeenCalledWith(
+        USER,
+        NotificationType.TRANSACTION_FAILED,
+        expect.stringContaining('staking is no longer allowed'),
+        'hash-err',
+      );
+      expect(failedTxRepo.save).toHaveBeenLastCalledWith(
+        expect.objectContaining({ notified: true }),
+      );
+    });
+
+    it('uses the inner transaction source for fee-bumps', async () => {
+      rpcServer.sendTransaction.mockResolvedValueOnce({
+        status: 'ERROR',
+        hash: 'hash-fb',
+        diagnosticEvents: [errorEvent(9)],
+      });
+      await service.submitTransaction({
+        source: 'GSPONSOR',
+        innerTransaction: { source: USER },
+      } as any);
+      expect(failedTxRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ userAddress: USER, ledger: null }),
+      );
+    });
+
+    it('does not index successful submissions', async () => {
+      rpcServer.sendTransaction.mockResolvedValueOnce({ status: 'PENDING' });
+      await service.submitTransaction({} as any);
+      expect(failedTxRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('does not re-notify for an already notified transaction', async () => {
+      failedTxRepo.findOne.mockResolvedValueOnce({
+        id: 1,
+        txHash: 'hash-dup',
+        userAddress: USER,
+        notified: true,
+      });
+      rpcServer.sendTransaction.mockResolvedValueOnce({
+        status: 'ERROR',
+        hash: 'hash-dup',
+        diagnosticEvents: [errorEvent(6)],
+      });
+      await service.submitTransaction({ source: USER } as any);
+      expect(failedTxRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 1, notified: true }),
+      );
+      expect(notificationsService.notify).not.toHaveBeenCalled();
+    });
+
+    it('persists without notifying when the user is unknown', async () => {
+      rpcServer.sendTransaction.mockResolvedValueOnce({
+        status: 'ERROR',
+        hash: 'hash-anon',
+        diagnosticEvents: [errorEvent(6)],
+      });
+      await service.submitTransaction({} as any);
+      expect(failedTxRepo.save).toHaveBeenCalledTimes(1);
+      expect(notificationsService.notify).not.toHaveBeenCalled();
+    });
+
+    it('truncates long notification messages to 255 chars', async () => {
+      jest
+        .spyOn(diagnosticParser, 'analyzeSendTransactionResponse')
+        .mockReturnValueOnce({
+          ...diagnosticParser.analyzeTransaction({
+            txHash: 'hash-long',
+            diagnosticEvents: [errorEvent(6)],
+          }),
+          summary: 'x'.repeat(400),
+        });
+      rpcServer.sendTransaction.mockResolvedValueOnce({
+        status: 'ERROR',
+        hash: 'hash-long',
+      });
+      await service.submitTransaction({ source: USER } as any);
+      const message = notificationsService.notify.mock.calls[0][2] as string;
+      expect(message.length).toBe(255);
+      expect(message.endsWith('…')).toBe(true);
+    });
+
+    it('swallows persistence errors so submission still returns', async () => {
+      failedTxRepo.findOne.mockRejectedValueOnce(new Error('db down'));
+      rpcServer.sendTransaction.mockResolvedValueOnce({
+        status: 'ERROR',
+        hash: 'hash-db',
+        diagnosticEvents: [errorEvent(6)],
+      });
+      await expect(
+        service.submitTransaction({ source: USER } as any),
+      ).resolves.toMatchObject({ status: 'ERROR' });
+    });
+
+    it('indexFailedTransaction parses a FAILED getTransaction response', async () => {
+      rpcServer.getTransaction.mockResolvedValueOnce({
+        status: SorobanRpc.Api.GetTransactionStatus.FAILED,
+        ledger: 777,
+        diagnosticEventsXdr: [errorEvent(15)],
+        envelopeXdr: undefined,
+      });
+
+      const report = await service.indexFailedTransaction('hash-get', USER);
+
+      expect(report!.contractError!.errorName).toBe('StakingCutoffActive');
+      expect(failedTxRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          txHash: 'hash-get',
+          ledger: 777,
+          userAddress: USER,
+        }),
+      );
+    });
+
+    it('indexFailedTransaction derives the user from the envelope', async () => {
+      const spy = jest
+        .spyOn(diagnosticParser, 'extractSourceAccount')
+        .mockReturnValueOnce(USER);
+      rpcServer.getTransaction.mockResolvedValueOnce({
+        status: SorobanRpc.Api.GetTransactionStatus.FAILED,
+        diagnosticEventsXdr: [errorEvent(6)],
+        envelopeXdr: 'ENV',
+      });
+      await service.indexFailedTransaction('hash-env');
+      expect(spy).toHaveBeenCalledWith('ENV');
+      expect(notificationsService.notify).toHaveBeenCalledWith(
+        USER,
+        NotificationType.TRANSACTION_FAILED,
+        expect.any(String),
+        'hash-env',
+      );
+    });
+
+    it('indexFailedTransaction ignores non-failed transactions', async () => {
+      rpcServer.getTransaction.mockResolvedValueOnce({
+        status: SorobanRpc.Api.GetTransactionStatus.SUCCESS,
+      });
+      await expect(service.indexFailedTransaction('ok')).resolves.toBeNull();
+      expect(failedTxRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('indexFailedTransaction never throws on RPC errors', async () => {
+      rpcServer.getTransaction.mockRejectedValueOnce(new Error('rpc down'));
+      await expect(service.indexFailedTransaction('boom')).resolves.toBeNull();
+    });
   });
 
   it('catches payout handler errors and does not throw', async () => {

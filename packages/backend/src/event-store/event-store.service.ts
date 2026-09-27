@@ -9,6 +9,26 @@ import {
 } from './entities/event-store-entry.entity';
 import { AggregateSnapshot } from './entities/aggregate-snapshot.entity';
 import { correlationStorage } from '../common/middleware/correlation-id.middleware';
+import { EventLog } from '../indexer/event-log.entity';
+
+export interface LedgerRangeFilter {
+  contractId: string;
+  /** First topic symbol, e.g. `PayoutClaimed`. Omit to scan every topic. */
+  topic0?: string;
+  /** Inclusive lower ledger bound. */
+  fromLedger: number;
+  /** Inclusive upper ledger bound. */
+  toLedger: number;
+  limit?: number;
+  /**
+   * Keyset cursor from the previous page: `{ ledger, id }` of its last row.
+   * Keeps deep pages O(limit) instead of O(offset).
+   */
+  after?: { ledger: number; id: number };
+}
+
+/** Hard cap so a single range scan can never pull an unbounded result set. */
+const MAX_RANGE_SCAN_LIMIT = 1000;
 
 export interface AggregateState {
   aggregateType: AggregateType;
@@ -40,7 +60,59 @@ export class EventStoreService {
     private readonly eventRepo: Repository<EventStoreEntry>,
     @InjectRepository(AggregateSnapshot)
     private readonly snapshotRepo: Repository<AggregateSnapshot>,
+    @InjectRepository(EventLog)
+    private readonly eventLogRepo: Repository<EventLog>,
   ) {}
+
+  /**
+   * Range scan over the raw, ledger-partitioned `event_logs` table (BE-003).
+   *
+   * The predicate shape — equality on contractId/topic0 plus a bounded
+   * ledger range, ordered by ledger — is deliberate: the ledger bounds let
+   * Postgres prune to the partitions overlapping [fromLedger, toLedger], and
+   * inside each one the (contractId, topic0, ledger) composite index serves
+   * both the filter and the ORDER BY without a sort.
+   */
+  async getRawEventsByLedgerRange(
+    filter: LedgerRangeFilter,
+  ): Promise<EventLog[]> {
+    const { contractId, topic0, fromLedger, toLedger, after } = filter;
+    const limit = Math.min(
+      Math.max(filter.limit ?? 100, 1),
+      MAX_RANGE_SCAN_LIMIT,
+    );
+
+    if (toLedger < fromLedger) return [];
+
+    const qb = this.eventLogRepo
+      .createQueryBuilder('log')
+      .where('log.contractId = :contractId', { contractId })
+      .andWhere('log.ledger >= :fromLedger', { fromLedger })
+      .andWhere('log.ledger <= :toLedger', { toLedger })
+      .orderBy('log.ledger', 'ASC')
+      .addOrderBy('log.id', 'ASC')
+      .limit(limit);
+
+    if (topic0) qb.andWhere('log.topic0 = :topic0', { topic0 });
+    if (after) {
+      qb.andWhere('(log.ledger, log.id) > (:afterLedger, :afterId)', {
+        afterLedger: after.ledger,
+        afterId: after.id,
+      });
+    }
+
+    const rows = await qb.getMany();
+    this.logger.debug({
+      msg: 'event_logs range scan',
+      contractId,
+      topic0: topic0 ?? null,
+      fromLedger,
+      toLedger,
+      limit,
+      returned: rows.length,
+    });
+    return rows;
+  }
 
   /**
    * Atomically append a single immutable event to the store. A single
